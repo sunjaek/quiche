@@ -1243,7 +1243,8 @@ impl HttpConn for Http3Conn {
                 },
 
                 Ok((stream_id, quiche::h3::Event::Data)) => {
-                    if let Ok(read) = self.h3_conn.recv_body(conn, stream_id, buf)
+                    while let Ok(read) =
+                        self.h3_conn.recv_body(conn, stream_id, buf)
                     {
                         debug!(
                             "got {} bytes of response data on stream {}",
@@ -1315,15 +1316,16 @@ impl HttpConn for Http3Conn {
                 },
 
                 Ok((_flow_id, quiche::h3::Event::Datagram)) => {
-                    let (len, flow_id, flow_id_len) =
-                        self.h3_conn.recv_dgram(conn, buf).unwrap();
-
-                    info!(
-                        "Received DATAGRAM flow_id={} len={} data={:?}",
-                        flow_id,
-                        len,
-                        buf[flow_id_len..len].to_vec()
-                    );
+                    while let Ok((len, flow_id, flow_id_len)) =
+                        self.h3_conn.recv_dgram(conn, buf)
+                    {
+                        info!(
+                            "Received DATAGRAM flow_id={} len={} data={:?}",
+                            flow_id,
+                            len,
+                            buf[flow_id_len..len].to_vec()
+                        );
+                    }
                 },
 
                 Ok((goaway_id, quiche::h3::Event::GoAway)) => {
@@ -1464,14 +1466,16 @@ impl HttpConn for Http3Conn {
                 Ok((_stream_id, quiche::h3::Event::Finished)) => (),
 
                 Ok((_, quiche::h3::Event::Datagram)) => {
-                    let (len, flow_id, flow_id_len) =
-                        self.h3_conn.recv_dgram(conn, buf).unwrap();
-
-                    info!(
-                        "Received DATAGRAM flow_id={} data={:?}",
-                        flow_id,
-                        &buf[flow_id_len..len].to_vec()
-                    );
+                    while let Ok((len, flow_id, flow_id_len)) =
+                        self.h3_conn.recv_dgram(conn, buf)
+                    {
+                        info!(
+                            "Received DATAGRAM flow_id={} len={} data={:?}",
+                            flow_id,
+                            len,
+                            buf[flow_id_len..len].to_vec()
+                        );
+                    }
                 },
 
                 Ok((goaway_id, quiche::h3::Event::GoAway)) => {

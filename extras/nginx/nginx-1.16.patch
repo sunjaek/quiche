@@ -1,4 +1,4 @@
-From 8b6bc45dd698ec1686fb281481cf16b638c2d6d1 Mon Sep 17 00:00:00 2001
+From 7f711688c68b4410e0e2f5f0ec8ce219ae137335 Mon Sep 17 00:00:00 2001
 From: Alessandro Ghedini <alessandro@cloudflare.com>
 Date: Thu, 22 Oct 2020 12:28:02 +0100
 Subject: [PATCH] Initial QUIC and HTTP/3 implementation using quiche
@@ -26,12 +26,12 @@ Subject: [PATCH] Initial QUIC and HTTP/3 implementation using quiche
  src/http/ngx_http_request.h             |    3 +
  src/http/ngx_http_request_body.c        |   29 +
  src/http/ngx_http_upstream.c            |   13 +
- src/http/v3/ngx_http_v3.c               | 2310 +++++++++++++++++++++++
- src/http/v3/ngx_http_v3.h               |   77 +
+ src/http/v3/ngx_http_v3.c               | 2332 +++++++++++++++++++++++
+ src/http/v3/ngx_http_v3.h               |   78 +
  src/http/v3/ngx_http_v3_filter_module.c |   68 +
  src/http/v3/ngx_http_v3_module.c        |  286 +++
  src/http/v3/ngx_http_v3_module.h        |   34 +
- 27 files changed, 3788 insertions(+), 11 deletions(-)
+ 27 files changed, 3811 insertions(+), 11 deletions(-)
  create mode 100644 auto/lib/quiche/conf
  create mode 100644 auto/lib/quiche/make
  create mode 100644 src/event/ngx_event_quic.c
@@ -1568,10 +1568,10 @@ index a7391d09a..398af2797 100644
      if (ngx_event_flags & NGX_USE_KQUEUE_EVENT) {
 diff --git a/src/http/v3/ngx_http_v3.c b/src/http/v3/ngx_http_v3.c
 new file mode 100644
-index 000000000..61e35c96a
+index 000000000..cb5ba610f
 --- /dev/null
 +++ b/src/http/v3/ngx_http_v3.c
-@@ -0,0 +1,2310 @@
+@@ -0,0 +1,2332 @@
 +
 +/*
 + * Copyright (C) Cloudflare, Inc.
@@ -1882,7 +1882,7 @@ index 000000000..61e35c96a
 +}
 +
 +
-+static ngx_int_t
++static void
 +ngx_http_v3_process_data(ngx_connection_t *c, int64_t stream_id)
 +{
 +    int                        rc;
@@ -1898,34 +1898,35 @@ index 000000000..61e35c96a
 +
 +    if (stream == NULL) {
 +
-+        return NGX_OK;
++        return;
 +    }
 +
 +    if (stream->skip_data) {
 +        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
 +                       "skipping http3 DATA frame");
 +
-+        return NGX_OK;
++        return;
 +    }
 +
 +    r = stream->request;
 +
 +    if (!r->request_body) {
-+        return NGX_AGAIN;
++        return;
 +    }
 +
 +    rc = ngx_http_v3_process_request_body(r, 1, stream->in_closed);
 +
 +    if (rc == NGX_AGAIN) {
-+        return NGX_AGAIN;
++        return;
 +    }
 +
 +    if (rc != NGX_OK) {
 +        stream->skip_data = 1;
++
 +        ngx_http_finalize_request(r, rc);
 +    }
 +
-+    return NGX_OK;
++    return;
 +}
 +
 +
@@ -1933,10 +1934,30 @@ index 000000000..61e35c96a
 +ngx_http_v3_process_blocked_streams(ngx_http_v3_connection_t *h3c)
 +{
 +    ngx_event_t               *wev;
-+    quiche_stream_iter        *writable;
++    quiche_stream_iter        *readable, *writable;
 +    ngx_http_v3_stream_t      *stream;
 +    uint64_t                   stream_id;
 +
++    /* Try processing read-blocked streams. */
++    readable = quiche_conn_readable(h3c->connection->quic->conn);
++
++    while (quiche_stream_iter_next(readable, &stream_id)) {
++        stream = ngx_http_v3_stream_lookup(h3c, stream_id);
++
++        if (stream == NULL) {
++            continue;
++        }
++
++        if (!stream->in_blocked) {
++            continue;
++        }
++
++        stream->in_blocked = 0;
++
++        ngx_http_v3_process_data(h3c->connection, stream_id);
++    }
++
++    /* Try processing write-blocked streams. */
 +    writable = quiche_conn_writable(h3c->connection->quic->conn);
 +
 +    while (quiche_stream_iter_next(writable, &stream_id)) {
@@ -1946,14 +1967,14 @@ index 000000000..61e35c96a
 +            continue;
 +        }
 +
-+        if (!stream->blocked) {
++        if (!stream->out_blocked) {
 +            continue;
 +        }
 +
 +        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, h3c->connection->log, 0,
 +                       "http3 stream unblocked %ui", stream->id);
 +
-+        stream->blocked = 0;
++        stream->out_blocked = 0;
 +
 +        wev = stream->request->connection->write;
 +
@@ -1998,6 +2019,9 @@ index 000000000..61e35c96a
 +    while (!c->error) {
 +        quiche_h3_event  *ev;
 +
++        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, h3c->connection->log, 0,
++                       "http3 poll");
++
 +        int64_t stream_id = quiche_h3_conn_poll(h3c->h3, c->quic->conn, &ev);
 +        if (stream_id < 0) {
 +            break;
@@ -2014,13 +2038,7 @@ index 000000000..61e35c96a
 +            }
 +
 +            case QUICHE_H3_EVENT_DATA: {
-+                if (ngx_http_v3_process_data(c, stream_id) == NGX_AGAIN) {
-+                    quiche_h3_event_free(ev);
-+
-+                    ngx_http_v3_handle_connection(h3c);
-+                    return;
-+                }
-+
++                ngx_http_v3_process_data(c, stream_id);
 +                break;
 +            }
 +
@@ -2950,6 +2968,10 @@ index 000000000..61e35c96a
 +                       "http3 read %z bytes of request body", len);
 +
 +        buf->last += len;
++
++        if (quiche_conn_stream_readable(c->quic->conn, r->qstream->id)) {
++            r->qstream->in_blocked = 1;
++        }
 +    }
 +
 +    if (last) {
@@ -3561,7 +3583,7 @@ index 000000000..61e35c96a
 +        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
 +                       "http3 stream blocked %ui", r->qstream->id);
 +
-+        r->qstream->blocked = 1;
++        r->qstream->out_blocked = 1;
 +
 +        fc->write->active = 1;
 +        fc->write->ready = 0;
@@ -3701,11 +3723,11 @@ index 000000000..61e35c96a
 +    }
 +
 +    if (blocked) {
-+        if (!stream->blocked) {
++        if (!stream->out_blocked) {
 +            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, stream->connection->connection->log, 0,
 +                           "http3 stream blocked %ui", stream->id);
 +
-+            stream->blocked = 1;
++            stream->out_blocked = 1;
 +
 +            fc->write->active = 1;
 +            fc->write->ready = 0;
@@ -3732,7 +3754,7 @@ index 000000000..61e35c96a
 +    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, h3c->connection->log, 0,
 +                   "http3 close stream %ui", stream->id);
 +
-+    if (stream->blocked) {
++    if (stream->out_blocked) {
 +        fc->write->handler = ngx_http_v3_close_stream_handler;
 +        fc->read->handler = ngx_http_empty_handler;
 +        return;
@@ -3848,8 +3870,8 @@ index 000000000..61e35c96a
 +            fc->close = 1;
 +        }
 +
-+        if (stream->blocked) {
-+            stream->blocked = 0;
++        if (stream->out_blocked) {
++            stream->out_blocked = 0;
 +
 +            ev = fc->write;
 +            ev->active = 0;
@@ -3884,10 +3906,10 @@ index 000000000..61e35c96a
 +}
 diff --git a/src/http/v3/ngx_http_v3.h b/src/http/v3/ngx_http_v3.h
 new file mode 100644
-index 000000000..45a55b898
+index 000000000..f82efd590
 --- /dev/null
 +++ b/src/http/v3/ngx_http_v3.h
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,78 @@
 +
 +/*
 + * Copyright (C) Cloudflare, Inc.
@@ -3944,7 +3966,8 @@ index 000000000..45a55b898
 +    ngx_uint_t                 in_closed:1;
 +    ngx_uint_t                 out_closed:1;
 +    ngx_uint_t                 skip_data:1;
-+    ngx_uint_t                 blocked:1;
++    ngx_uint_t                 in_blocked:1;
++    ngx_uint_t                 out_blocked:1;
 +};
 +
 +
