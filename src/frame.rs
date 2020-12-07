@@ -723,7 +723,7 @@ impl Frame {
 
             Frame::Datagram { data } => {
                 1 + // frame type
-                octets::varint_len(data.len() as u64) + // length
+                2 + // length, always encode as 2-byte varint
                 data.len() // data
             },
         }
