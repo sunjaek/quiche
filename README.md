@@ -13,6 +13,8 @@ and handling connection state. The application is responsible for providing I/O
 For more information on how quiche came about and some insights into its design
 you can read a [post] on Cloudflare's blog that goes into some more detail.
 
+modified for modeling http/3
+
 [quiche]: https://docs.quic.tech/quiche/
 [ietf]: https://quicwg.org/
 [post]: https://blog.cloudflare.com/enjoy-a-slice-of-quic-and-rust/
