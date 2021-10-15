@@ -722,7 +722,7 @@ impl Recovery {
                     self.in_flight_count[epoch] =
                         self.in_flight_count[epoch].saturating_sub(1);
 
-                    trace!(
+                    println!(
                         "{} packet {} lost on epoch {}",
                         trace_id,
                         unacked.pkt_num,

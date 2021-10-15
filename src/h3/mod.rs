@@ -452,6 +452,8 @@ pub struct Config {
     max_header_list_size: Option<u64>,
     qpack_max_table_capacity: Option<u64>,
     qpack_blocked_streams: Option<u64>,
+    promise_headers_path: Option<String>,
+    push_urgency: Option<u8>,
 }
 
 impl Config {
@@ -461,6 +463,8 @@ impl Config {
             max_header_list_size: None,
             qpack_max_table_capacity: None,
             qpack_blocked_streams: None,
+            promise_headers_path: None,
+            push_urgency: None,
         })
     }
 
@@ -489,6 +493,26 @@ impl Config {
     /// The default value is `0`.
     pub fn set_qpack_blocked_streams(&mut self, v: u64) {
         self.qpack_blocked_streams = Some(v);
+    }
+
+    /// Sets the `promse_headers_path` setting.
+    ///
+    pub fn set_promise_headers_path(&mut self, path: &str) {
+        if let 0 = path.len() {
+            self.promise_headers_path = None
+        } else {
+            self.promise_headers_path = Some(path.to_string());
+        }
+    }
+
+    /// Sets the `promse_headers_path` setting.
+    ///
+    pub fn set_push_urgency(&mut self, v: u64) {
+        if !(0..=255).contains(&v) {
+            self.push_urgency = Some(128 as u8);
+        } else {
+            self.push_urgency = Some(v as u8);
+        }        
     }
 }
 
@@ -589,6 +613,20 @@ pub enum Event {
 
     /// GOAWAY was received.
     GoAway,
+
+    /// [sunj] 2021-06-21 Implementing Server Push
+    PushPromised {
+        /// Push ID
+        push_id: u64,
+        /// The anticipated request headers
+        list: Vec<Header>,
+    },
+
+    /// [sunj] 2021-06-21 Implementing Server Push
+    Push {
+        /// Push ID
+        push_id: u64,
+    }
 }
 
 struct ConnectionSettings {
@@ -596,6 +634,13 @@ struct ConnectionSettings {
     pub qpack_max_table_capacity: Option<u64>,
     pub qpack_blocked_streams: Option<u64>,
     pub h3_datagram: Option<u64>,
+
+    // [sunj] 2021-09-07 Implementing server push
+    pub promise_headers: Option<HashMap<u64, Vec<Header>>>,
+
+    // [sunj] 2021-10-13 Implementing server push
+    pub push_urgency: Option<u8>,
+
 }
 
 struct QpackStreams {
@@ -627,6 +672,15 @@ pub struct Connection {
 
     max_push_id: u64,
 
+    // [sunj] 2021-07-07 Implementing server push
+    next_push_id: u64,
+
+    // [sunj] 2021-09-06 Implementing server push
+    // Push streams indexed by its push ID
+    push_map: HashMap<u64, u64>,
+
+    //promise_headers_map: HashMap<u64, Vec<Header>>,
+
     finished_streams: VecDeque<u64>,
 
     frames_greased: bool,
@@ -645,6 +699,45 @@ impl Connection {
         let initial_uni_stream_id = if is_server { 0x3 } else { 0x2 };
         let h3_datagram = if enable_dgram { Some(1) } else { None };
 
+        let promise_headers = match &config.promise_headers_path {
+            Some(v) => {
+                let mut map = HashMap::new();
+                trace!("[sunj] promise_headers_path={}", v);
+                let file = std::fs::File::open(&v).unwrap();
+                let reader = std::io::BufReader::new(file);
+                
+                use serde_json::Value;
+
+                let raw: Value = serde_json::from_reader(reader).unwrap();
+                let promises = raw.get("promises").unwrap();
+                if let Some(items) = promises.as_array() {
+                    for item in items {
+                        let position = item.get("position").unwrap().as_u64().unwrap();
+                        let headers = item.get("headers").unwrap();
+                        let mut promise_header = Vec::new();
+
+                        let method = headers.get("method").unwrap().as_str().unwrap();
+                        promise_header.push(Header::new(b":method", method.as_bytes()));
+
+                        let scheme = headers.get("scheme").unwrap().as_str().unwrap();
+                        promise_header.push(Header::new(b":scheme", scheme.as_bytes()));
+                        
+                        let authority = headers.get("authority").unwrap().as_str().unwrap();
+                        promise_header.push(Header::new(b":authority", authority.as_bytes()));
+
+                        let path = headers.get("path").unwrap().as_str().unwrap();
+                        promise_header.push(Header::new(b":path", path.as_bytes()));
+                        
+                        map.insert(position, promise_header);
+                    }
+                }
+
+                Some(map)
+            },
+
+            None => None,
+        };
+
         Ok(Connection {
             is_server,
 
@@ -659,6 +752,8 @@ impl Connection {
                 qpack_max_table_capacity: config.qpack_max_table_capacity,
                 qpack_blocked_streams: config.qpack_blocked_streams,
                 h3_datagram,
+                promise_headers,
+                push_urgency: config.push_urgency,
             },
 
             peer_settings: ConnectionSettings {
@@ -666,6 +761,8 @@ impl Connection {
                 qpack_max_table_capacity: None,
                 qpack_blocked_streams: None,
                 h3_datagram: None,
+                promise_headers: None,
+                push_urgency: None,
             },
 
             control_stream_id: None,
@@ -684,7 +781,13 @@ impl Connection {
                 decoder_stream_id: None,
             },
 
-            max_push_id: 0,
+            // [sunj] 2021-09-08 Unlimit max_push_id
+            max_push_id: 65535,
+
+            // [sunj] 2021-07-07 Implementing Server Push
+            next_push_id: 0,
+
+            push_map: HashMap::new(),
 
             finished_streams: VecDeque::new(),
 
@@ -736,6 +839,36 @@ impl Connection {
 
         Ok(http3_conn)
     }
+
+    /// [sunj] 2021-09-07 Implemeting server push
+    pub fn with_transport_and_promises(
+        conn: &mut super::Connection, config: &Config,
+    ) -> Result<Connection> {
+        let mut http3_conn =
+            Connection::new(config, conn.is_server, conn.dgram_enabled())?;
+
+        match http3_conn.send_settings(conn) {
+            Ok(_) => (),
+
+            Err(e) => {
+                conn.close(true, e.to_wire(), b"Error opening control stream")?;
+                return Err(e);
+            },
+        };
+
+        // Try opening QPACK streams, but ignore errors if it fails since we
+        // don't need them right now.
+        http3_conn.open_qpack_encoder_stream(conn).ok();
+        http3_conn.open_qpack_decoder_stream(conn).ok();
+
+        if conn.grease {
+            // Try opening a GREASE stream, but ignore errors since it's not
+            // critical.
+            http3_conn.open_grease_stream(conn).ok();
+        }
+
+        Ok(http3_conn)
+    }    
 
     /// Sends an HTTP/3 request.
     ///
@@ -828,6 +961,7 @@ impl Connection {
         &mut self, conn: &mut super::Connection, stream_id: u64, headers: &[T],
         priority: &str, fin: bool,
     ) -> Result<()> {
+
         if !self.streams.contains_key(&stream_id) {
             return Err(Error::FrameUnexpected);
         }
@@ -873,6 +1007,382 @@ impl Connection {
 
         Ok(())
     }
+
+    /// [sunj] 2021-09-08 Implementing server push
+    pub fn send_push_headers<T: NameValue>(
+        &mut self, conn: &mut super::Connection, push_stream_id: u64, headers: &[T],
+        fin: bool, push_id: u64,
+    ) -> Result<()> {
+        trace!(
+            "[sunj-push] send_push_headers() push_stream_id={}, push_id={}, phase 0",
+            push_stream_id,
+            push_id
+        );
+        if let Ok(()) = self.open_uni_stream_promised(
+            conn,
+            stream::HTTP3_PUSH_STREAM_TYPE_ID,
+            Some(push_id),
+            push_stream_id
+        ) {
+            trace!(
+                "[sunj-push] send_push_headers() push_stream_id={}, push_id={} phase 1",
+                push_stream_id,
+                push_id
+            );
+            // For web server (e.g., NGINX) lookup.
+            //self.push_map.insert(push_id, push_stream_id);
+
+            self.streams
+            .insert(push_stream_id, stream::Stream::new(push_stream_id, true));
+
+            trace!(
+                "[sunj-push] send_push_headers() push_stream_id={}, push_id={} phase 2",
+                push_stream_id,
+                push_id
+            );
+            // The underlying QUIC stream does not exist yet, so calls to e.g.
+            // stream_capacity() will fail. By writing a 0-length buffer, we force
+            // the creation of the QUIC stream state, without actually writing
+            // anything.
+            if let Err(e) = conn.stream_send(push_stream_id, b"", false) {
+                self.streams.remove(&push_stream_id);
+                trace!(
+                    "[sunj-push] send_push_headers() push_stream_id={}, push_id={} phase 3",
+                    push_stream_id,
+                    push_id
+                );
+                return Err(e.into());
+            };
+
+            trace!(
+                "[sunj-push] send_push_headers() push_stream_id={}, push_id={} phase 4",
+                push_stream_id,
+                push_id
+            );
+            self.send_headers(conn, push_stream_id, headers, fin)?;
+
+            trace!(
+                "[sunj-push] send_push_headers() push_stream_id={}, push_id={}",
+                push_stream_id,
+                push_id
+            );
+            Ok(())
+        } else {
+            Err(Error::IdError)
+        }
+
+    }
+
+    /// [sunj] 2021-07-07 Implementing Server Push
+    /// Sends an HTTP/3 server push on the specified stream
+    ///
+    /// This method sends a push promise frame with the provided `headers` and
+    /// returns corresponding `push_id`. To fulfill the promised push, call
+    /// [`fulfill_push()`] with the same `conn` and the returned `push_id`.
+    ///
+    /// Call in this order in application:
+    /// (1) `send_response()`
+    /// (2) `push_promise()`
+    /// (3) `send_body()`
+    /// (4) `fulfill_push()`
+    pub fn push_promise(
+        &mut self, conn: &mut super::Connection, stream_id: u64,
+        headers: &[Header], fin: bool,
+    ) -> Result<u64> {
+        let mut d = [42; 65535];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        let stream_cap = conn.stream_capacity(stream_id)?;
+
+        let header_block = self.encode_header_block(headers)?;
+
+        let push_id = self.next_push_id;
+        if push_id > self.max_push_id {
+            return Err(Error::IdError);
+        }
+
+        let overhead = octets::varint_len(frame::PUSH_PROMISE_FRAME_TYPE_ID)
+            + octets::varint_len(push_id)
+            + octets::varint_len(header_block.len() as u64);
+
+        if stream_cap < overhead + header_block.len() {
+            return Err(Error::StreamBlocked);
+        }
+
+        info!(
+            "{} tx frm PUSH_PROMISE stream={} len={} fin={} push={}",
+            conn.trace_id(),
+            stream_id,
+            header_block.len(),
+            fin,
+            push_id
+        );
+
+        // Cap the frame payload length to the stream's capacity.
+        let header_block_len = std::cmp::min(header_block.len(), stream_cap - overhead);
+
+        // If we can't send the entire body, set the fin flag to false so the
+        // application can try again later.
+        let fin = if header_block_len != header_block.len() { false } else { fin };
+
+        // Again, avoid sending 0-length DATA frames when the fin flag is false.
+        if header_block_len == 0 && !fin {
+            return Err(Error::Done);
+        }
+
+        let frame = frame::Frame::PushPromise {
+            push_id,
+            header_block,
+        };
+        frame.to_bytes(&mut b)?;
+        let off = b.off();
+
+        conn.stream_send(stream_id, &d[..off], fin)?;
+
+        if let Some(s) = self.streams.get_mut(&stream_id) {
+            s.initialize_local();
+        }
+
+        self.next_push_id =
+            self.next_push_id.checked_add(1).ok_or(Error::IdError)?;
+
+        Ok(push_id)
+    }
+
+    /// [sunj] 2021-09-07 Implementing Server Push
+    pub fn push_promise_with_position(
+        &mut self, conn: &mut super::Connection, stream_id: u64,
+        pos: u64, fin: bool,
+    ) -> Result<(u64, Event)> {
+        let mut d = [42; 65535];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        let stream_cap = conn.stream_capacity(stream_id)?;
+
+        let promise_headers = self.local_settings.promise_headers
+            .as_ref()
+            .unwrap()
+            .get(&pos)
+            .unwrap()
+            .clone();
+        trace!("[sunj] push_promise_with_position() position={}, promise_headers={:?}", pos, promise_headers);
+
+        let header_block = self.encode_header_block(&promise_headers)?;
+
+        let push_id = self.next_push_id;
+        if push_id > self.max_push_id {
+            trace!("[sunj] push_promise_with_position() max_push_id error");
+            return Err(Error::IdError);
+        }
+
+        let overhead = octets::varint_len(frame::PUSH_PROMISE_FRAME_TYPE_ID)
+            + octets::varint_len(push_id)
+            + octets::varint_len(header_block.len() as u64);
+
+        if stream_cap < overhead + header_block.len() {
+            trace!("[sunj] stream blocked");
+            return Err(Error::StreamBlocked);
+        }
+
+        info!(
+            "{} tx frm PUSH_PROMISE stream={} len={} fin={} push={}",
+            conn.trace_id(),
+            stream_id,
+            header_block.len(),
+            fin,
+            push_id
+        );
+
+        // Cap the frame payload length to the stream's capacity.
+        let header_block_len = std::cmp::min(header_block.len(), stream_cap - overhead);
+
+        // If we can't send the entire body, set the fin flag to false so the
+        // application can try again later.
+        let fin = if header_block_len != header_block.len() { false } else { fin };
+
+        // Again, avoid sending 0-length DATA frames when the fin flag is false.
+        if header_block_len == 0 && !fin {
+            return Err(Error::Done);
+        }
+
+        let frame = frame::Frame::PushPromise {
+            push_id,
+            header_block,
+        };
+        frame.to_bytes(&mut b)?;
+        let off = b.off();
+        conn.stream_send(stream_id, &d[..off], fin)?;
+        if let Some(s) = self.streams.get_mut(&stream_id) {
+            s.initialize_local();
+        }
+        
+        self.next_push_id =
+            self.next_push_id.checked_add(1).ok_or(Error::IdError)?;
+
+        // It returns push stream_id and the application should keep it to push it.
+        let stream_id = self.next_uni_stream_id;
+        trace!("[sunj] reserved stream_id={}", stream_id);
+
+        self.next_uni_stream_id = self
+        .next_uni_stream_id
+        .checked_add(4)
+        .ok_or(Error::IdError)?;
+
+        Ok((stream_id, Event::Headers {
+            list: promise_headers,
+            has_body: false,
+        }))
+    }
+
+    /// [sunj] 2021-07-07 Implementing Server Push
+    /// Fulfills an HTTP/3 Server Push of the specified Push ID
+    ///
+    /// This method sends opens a push stream with the provided `push_id`
+    ///
+    /// Call in this order in application:
+    /// (1) `send_response()`
+    /// (2) `push_promise()`
+    /// (3) `send_body()`
+    /// (4) `fulfill_push()`
+    pub fn fulfill_push(
+        &mut self, conn: &mut super::Connection, push_id: u64, body: &[u8],
+        fin: bool,
+    ) -> Result<(usize, u64)> {
+        let mut d = [42; 10];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        match self.open_uni_stream(
+            conn,
+            stream::HTTP3_PUSH_STREAM_TYPE_ID,
+            Some(push_id),
+        ) {
+            Ok(push_stream_id) => {
+                
+                // For web server (e.g., NGINX) lookup.
+                self.push_map.insert(push_id, push_stream_id);
+
+                let overhead = octets::varint_len(frame::DATA_FRAME_TYPE_ID)
+                    + octets::varint_len(body.len() as u64);
+
+                let stream_cap = conn.stream_capacity(push_stream_id)?;
+
+                if stream_cap <= overhead {
+                    //println!("overhead is large, stream_cap={}, overhead={}", stream_cap, overhead);
+                    return Err(Error::Done);
+                    //return Ok((0, push_stream_id));
+                }
+
+                let body_len = std::cmp::min(body.len(), stream_cap - overhead);
+
+                // partial push
+                let fin = if body_len != body.len() { false } else { fin };
+
+                info!(
+                    "{} tx frm (pushed) DATA stream={} len={} fin={} push={}",
+                    conn.trace_id(),
+                    push_stream_id,
+                    body_len,
+                    fin,
+                    push_id
+                );
+
+                b.put_varint(frame::DATA_FRAME_TYPE_ID)?;
+                b.put_varint(body_len as u64)?;
+                let off = b.off();
+                conn.stream_send(push_stream_id, &d[..off], false)?;
+
+                // Return how many bytes were written, excluding the frame header.
+                // Sending body separately avoids unnecessary copy.
+                let written =
+                    conn.stream_send(push_stream_id, &body[..body_len], fin)?;
+
+                if fin
+                    && written == body.len()
+                    && conn.stream_finished(push_stream_id)
+                {
+                    self.streams.remove(&push_stream_id);
+                }
+
+                return Ok((written, push_stream_id));
+            }
+
+            Err(Error::IdError) => {
+                trace!("{} PUSH stream blocked", conn.trace_id());
+                return Ok((0, 0));
+            }
+
+            Err(e) => return Err(e),
+        };
+    }
+
+    /// [sunj] 2021-07-07 Implementing Server Push
+    /// Sends a HTTP/3 Push stream on already created stream
+    pub fn continue_push(
+        &mut self, conn: &mut super::Connection, push_id: u64, body: &[u8],
+        stream_id: u64, fin: bool,
+    ) -> Result<usize> {
+        let mut d = [42; 10];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        let overhead = octets::varint_len(frame::DATA_FRAME_TYPE_ID)
+            + octets::varint_len(body.len() as u64);
+
+        let stream_cap = conn.stream_capacity(stream_id)?;
+
+        if stream_cap <= overhead {
+            return Err(Error::Done);
+        }
+
+        let body_len = std::cmp::min(body.len(), stream_cap - overhead);
+
+        // partial push
+        let fin = if body_len != body.len() { false } else { fin };
+
+        info!(
+            "{} tx frm (pushed) DATA stream={} len={} fin={} push={}",
+            conn.trace_id(),
+            stream_id,
+            body_len,
+            fin,
+            push_id
+        );
+
+        b.put_varint(frame::DATA_FRAME_TYPE_ID)?;
+        b.put_varint(body_len as u64)?;
+        let off = b.off();
+        conn.stream_send(stream_id, &d[..off], false)?;
+
+        // Return how many bytes were written, excluding the frame header.
+        // Sending body separately avoids unnecessary copy.
+        let written = conn.stream_send(stream_id, &body[..body_len], fin)?;
+
+        if fin && written == body.len() && conn.stream_finished(stream_id) {
+            self.streams.remove(&stream_id);
+        }
+
+        return Ok(written);
+    }
+
+    /// [sunj] 2021-07-07 Implementing Server Push
+    /// Sends an HTTP/3 MAX_PUSH_ID frame
+    pub fn send_enable_push(
+        &mut self, conn: &mut super::Connection, max: u64,
+    ) -> Result<()> {
+        let frame = frame::Frame::MaxPushId { push_id: max };
+
+        let mut d = [42; 128];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        frame.to_bytes(&mut b)?;
+
+        let off = b.off();
+
+        if let Some(id) = self.control_stream_id {
+            conn.stream_send(id, &d[..off], false)?;
+        }
+
+        Ok(())
+    }    
 
     fn encode_header_block<T: NameValue>(
         &mut self, headers: &[T],
@@ -990,9 +1500,9 @@ impl Connection {
         };
 
         // Avoid sending 0-length DATA frames when the fin flag is false.
-        if body.is_empty() && !fin {
-            return Err(Error::Done);
-        }
+        // if body.is_empty() && !fin {
+        //     return Err(Error::Done);
+        // }
 
         let overhead = octets::varint_len(frame::DATA_FRAME_TYPE_ID) +
             octets::varint_len(body.len() as u64);
@@ -1022,9 +1532,9 @@ impl Connection {
         let fin = if body_len != body.len() { false } else { fin };
 
         // Again, avoid sending 0-length DATA frames when the fin flag is false.
-        if body_len == 0 && !fin {
-            return Err(Error::Done);
-        }
+        // if body_len == 0 && !fin {
+        //     return Err(Error::Done);
+        // }
 
         trace!(
             "{} tx frm DATA stream={} len={} fin={}",
@@ -1043,8 +1553,128 @@ impl Connection {
         // Sending body separately avoids unnecessary copy.
         let written = conn.stream_send(stream_id, &body[..body_len], fin)?;
 
+        trace!(
+            "[sunj-data] fin={} written={} body.len()={} conn.stream_finished()={}",
+            fin,
+            written,
+            body.len(),
+            conn.stream_finished(stream_id)
+        );
+
         if fin && written == body.len() && conn.stream_finished(stream_id) {
             self.streams.remove(&stream_id);
+            trace!(
+                "done {}", stream_id
+            );
+        }
+
+        Ok(written)
+    }
+
+    /// Sends an HTTP/3 push body chunk on the given stream.
+    ///
+    /// On success the number of bytes written is returned, or [`Done`] if no
+    /// bytes could be written (e.g. because the stream is blocked).
+    ///
+    /// Note that the number of written bytes returned can be lower than the
+    /// length of the input buffer when the underlying QUIC stream doesn't have
+    /// enough capacity for the operation to complete.
+    ///
+    /// When a partial write happens (including when [`Done`] is returned) the
+    /// application should retry the operation once the stream is reported as
+    /// writable again.
+    ///
+    /// [`Done`]: enum.Error.html#variant.Done
+    pub fn send_push_body(
+        &mut self, conn: &mut super::Connection, stream_id: u64, body: &[u8],
+        fin: bool,
+    ) -> Result<usize> {
+        let mut d = [42; 10];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        // Validate that it is sane to send data on the stream.
+        if stream_id % 4 != 3 {
+            return Err(Error::FrameUnexpected);
+        }
+
+        match self.streams.get(&stream_id) {
+            Some(s) =>
+                if !s.local_initialized() {
+                    return Err(Error::FrameUnexpected);
+                },
+
+            None => {
+                return Err(Error::FrameUnexpected);
+            },
+        };
+
+        // Avoid sending 0-length DATA frames when the fin flag is false.
+        // if body.is_empty() && !fin {
+        //     return Err(Error::Done);
+        // }
+
+        let overhead = octets::varint_len(frame::DATA_FRAME_TYPE_ID) +
+            octets::varint_len(body.len() as u64);
+
+        let stream_cap = match conn.stream_capacity(stream_id) {
+            Ok(v) => v,
+
+            Err(e) => {
+                if conn.stream_finished(stream_id) {
+                    self.streams.remove(&stream_id);
+                }
+
+                return Err(e.into());
+            },
+        };
+
+        // Make sure there is enough capacity to send the DATA frame header.
+        if stream_cap < overhead {
+            return Err(Error::Done);
+        }
+
+        // Cap the frame payload length to the stream's capacity.
+        let body_len = std::cmp::min(body.len(), stream_cap - overhead);
+
+        // If we can't send the entire body, set the fin flag to false so the
+        // application can try again later.
+        let fin = if body_len != body.len() { false } else { fin };
+
+        // Again, avoid sending 0-length DATA frames when the fin flag is false.
+        // if body_len == 0 && !fin {
+        //     return Err(Error::Done);
+        // }
+
+        trace!(
+            "{} tx frm PUSH DATA stream={} len={} fin={}",
+            conn.trace_id(),
+            stream_id,
+            body_len,
+            fin
+        );
+
+        b.put_varint(frame::DATA_FRAME_TYPE_ID)?;
+        b.put_varint(body_len as u64)?;
+        let off = b.off();
+        conn.stream_send(stream_id, &d[..off], false)?;
+
+        // Return how many bytes were written, excluding the frame header.
+        // Sending body separately avoids unnecessary copy.
+        let written = conn.stream_send(stream_id, &body[..body_len], fin)?;
+
+        trace!(
+            "[sunj-push] fin={} written={} body.len()={} conn.stream_finished()={}",
+            fin,
+            written,
+            body.len(),
+            conn.stream_finished(stream_id)
+        );
+
+        if fin && written == body.len() && conn.stream_finished(stream_id) {
+            self.streams.remove(&stream_id);
+            trace!(
+                "done {}", stream_id
+            );
         }
 
         Ok(written)
@@ -1392,8 +2022,9 @@ impl Connection {
         Ok(())
     }
 
+    // [sunj] 2021-07-07 Implementing Server Push
     fn open_uni_stream(
-        &mut self, conn: &mut super::Connection, ty: u64,
+        &mut self, conn: &mut super::Connection, ty: u64, push_id: Option<u64>
     ) -> Result<u64> {
         let stream_id = self.next_uni_stream_id;
 
@@ -1406,18 +2037,22 @@ impl Connection {
             stream::QPACK_ENCODER_STREAM_TYPE_ID |
             stream::QPACK_DECODER_STREAM_TYPE_ID => {
                 conn.stream_priority(stream_id, 0, true)?;
+                conn.stream_send(stream_id, b.put_varint(ty)?, false)?;
             },
 
-            // TODO: Server push
-            stream::HTTP3_PUSH_STREAM_TYPE_ID => (),
+            // [sunj] 2021-07-07 Server push
+            stream::HTTP3_PUSH_STREAM_TYPE_ID => {
+                conn.stream_priority(stream_id, 127, true)?;
+                conn.stream_send(stream_id, b.put_varint(ty)?, false)?;
+                conn.stream_send(stream_id, b.put_varint(push_id.unwrap())?, false)?;
+            },
 
             // Anything else is a GREASE stream, so make it the least important.
             _ => {
                 conn.stream_priority(stream_id, 255, true)?;
+                conn.stream_send(stream_id, b.put_varint(ty)?, false)?;
             },
         }
-
-        conn.stream_send(stream_id, b.put_varint(ty)?, false)?;
 
         // To avoid skipping stream IDs, we only calculate the next available
         // stream ID when data has been successfully buffered.
@@ -1429,11 +2064,63 @@ impl Connection {
         Ok(stream_id)
     }
 
+    // [sunj] 2021-09-08 Implementing server push
+    // push_promise_with_position() gives the stream_id which should be kept by the application.
+    fn open_uni_stream_promised(
+        &mut self, conn: &mut super::Connection, ty: u64, push_id: Option<u64>, push_stream_id: u64
+    ) -> Result<()> {
+        let mut d = [0; 8];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        match ty {
+            // Control and QPACK streams are the most important to schedule.
+            stream::HTTP3_CONTROL_STREAM_TYPE_ID |
+            stream::QPACK_ENCODER_STREAM_TYPE_ID |
+            stream::QPACK_DECODER_STREAM_TYPE_ID => {
+                conn.stream_priority(push_stream_id, 0, true)?;
+                conn.stream_send(push_stream_id, b.put_varint(ty)?, false)?;
+            },
+
+            // [sunj] 2021-07-07 Server push
+            stream::HTTP3_PUSH_STREAM_TYPE_ID => {
+                if let Some(v) = self.local_settings.push_urgency {
+                    trace!(
+                        "[sunj-push] open_uni_stream_promised() push_id={:?}, push_stream_id={}, Some(v)",
+                        push_id,
+                        push_stream_id,                        
+                    );
+                    conn.stream_priority(push_stream_id, v, true)?;
+                    trace!("[sunj-push] open_uni_stream_promised() 1");
+                    conn.stream_send(push_stream_id, b.put_varint(ty)?, false)?;
+                    trace!("[sunj-push] open_uni_stream_promised() 2");
+                    conn.stream_send(push_stream_id, b.put_varint(push_id.unwrap())?, false)?;
+                    trace!(
+                        "[sunj-push] open_uni_stream_promised() push_id={:?}, push_stream_id={}, Some(v) returns.",
+                        push_id,
+                        push_stream_id,
+                    );
+                } else {
+                    conn.stream_priority(push_stream_id, 128, true)?;
+                    conn.stream_send(push_stream_id, b.put_varint(ty)?, false)?;
+                    conn.stream_send(push_stream_id, b.put_varint(push_id.unwrap())?, false)?;
+                }
+            },
+
+            // Anything else is a GREASE stream, so make it the least important.
+            _ => {
+                conn.stream_priority(push_stream_id, 255, true)?;
+                conn.stream_send(push_stream_id, b.put_varint(ty)?, false)?;
+            },
+        }
+
+        Ok(())
+    }
+
     fn open_qpack_encoder_stream(
         &mut self, conn: &mut super::Connection,
     ) -> Result<()> {
         self.local_qpack_streams.encoder_stream_id = Some(
-            self.open_uni_stream(conn, stream::QPACK_ENCODER_STREAM_TYPE_ID)?,
+            self.open_uni_stream(conn, stream::QPACK_ENCODER_STREAM_TYPE_ID, None)?,
         );
 
         Ok(())
@@ -1443,7 +2130,7 @@ impl Connection {
         &mut self, conn: &mut super::Connection,
     ) -> Result<()> {
         self.local_qpack_streams.decoder_stream_id = Some(
-            self.open_uni_stream(conn, stream::QPACK_DECODER_STREAM_TYPE_ID)?,
+            self.open_uni_stream(conn, stream::QPACK_DECODER_STREAM_TYPE_ID, None)?,
         );
 
         Ok(())
@@ -1507,7 +2194,7 @@ impl Connection {
     /// Opens a new unidirectional stream with a GREASE type and sends some
     /// unframed payload.
     fn open_grease_stream(&mut self, conn: &mut super::Connection) -> Result<()> {
-        match self.open_uni_stream(conn, grease_value()) {
+        match self.open_uni_stream(conn, grease_value(), None) {
             Ok(stream_id) => {
                 trace!("{} open GREASE stream {}", conn.trace_id(), stream_id);
 
@@ -1529,7 +2216,7 @@ impl Connection {
     /// Sends SETTINGS frame based on HTTP/3 configuration.
     fn send_settings(&mut self, conn: &mut super::Connection) -> Result<()> {
         self.control_stream_id = Some(
-            self.open_uni_stream(conn, stream::HTTP3_CONTROL_STREAM_TYPE_ID)?,
+            self.open_uni_stream(conn, stream::HTTP3_CONTROL_STREAM_TYPE_ID, None)?,
         );
 
         let grease = if conn.grease {
@@ -1658,6 +2345,12 @@ impl Connection {
 
                                 return Err(Error::StreamCreationError);
                             }
+
+                            info!(
+                                "{} push stream received {}",
+                                conn.trace_id(),
+                                stream_id
+                            );
                         },
 
                         stream::Type::QpackEncoder => {
@@ -1812,7 +2505,11 @@ impl Connection {
                         break;
                     }
 
-                    return Ok((stream_id, Event::Data));
+                    match stream.push_id() {
+                        Some(push_id) => return Ok((stream_id, Event::Push { push_id })),
+                        None => return Ok((stream_id, Event::Data)),
+                    }
+                    
                 },
 
                 stream::State::QpackInstruction => {
@@ -1888,6 +2585,8 @@ impl Connection {
                     qpack_max_table_capacity,
                     qpack_blocked_streams,
                     h3_datagram,
+                    promise_headers: None,
+                    push_urgency: None,
                 };
 
                 if let Some(1) = h3_datagram {
@@ -2036,7 +2735,7 @@ impl Connection {
                 self.max_push_id = push_id;
             },
 
-            frame::Frame::PushPromise { .. } => {
+            frame::Frame::PushPromise { push_id, header_block } => {
                 if self.is_server {
                     conn.close(
                         true,
@@ -2057,7 +2756,31 @@ impl Connection {
                     return Err(Error::FrameUnexpected);
                 }
 
-                // TODO: implement more checks and PUSH_PROMISE event
+                info!("Received PushPromise: push={}", push_id);
+
+                // Use "infinite" as default value for max_header_list_size if
+                // it is not configured by the application.
+                let max_size = self
+                    .local_settings
+                    .max_header_list_size
+                    .unwrap_or(std::u64::MAX);
+
+                let headers = self
+                    .qpack_decoder
+                    .decode(&header_block[..], max_size)
+                    .map_err(|e| match e {
+                        qpack::Error::HeaderListTooLarge => Error::ExcessiveLoad,
+
+                        _ => Error::QpackDecompressionFailed,
+                    })?;
+
+                return Ok((
+                    stream_id,
+                    Event::PushPromised {
+                        list: headers,
+                        push_id,
+                    },
+                ));
             },
 
             frame::Frame::CancelPush { .. } => {
@@ -3732,6 +4455,7 @@ mod tests {
                 .open_uni_stream(
                     &mut s.pipe.client,
                     stream::HTTP3_CONTROL_STREAM_TYPE_ID,
+                    None,
                 )
                 .unwrap(),
         );
@@ -3781,6 +4505,7 @@ mod tests {
                 .open_uni_stream(
                     &mut s.pipe.client,
                     stream::HTTP3_CONTROL_STREAM_TYPE_ID,
+                    None
                 )
                 .unwrap(),
         );
@@ -3790,6 +4515,7 @@ mod tests {
                 .open_uni_stream(
                     &mut s.pipe.server,
                     stream::HTTP3_CONTROL_STREAM_TYPE_ID,
+                    None
                 )
                 .unwrap(),
         );

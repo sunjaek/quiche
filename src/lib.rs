@@ -424,6 +424,10 @@ pub enum Error {
 
     /// Error in congestion control.
     CongestionControl,
+
+    /// [sunj] 2021-06-22 Implmenting Stream Scheduilng
+    /// Error in stream scheduilng policy
+    StreamScheduling,
 }
 
 impl Error {
@@ -458,6 +462,9 @@ impl Error {
             Error::FinalSize => -13,
             Error::CongestionControl => -14,
             Error::StreamStopped { .. } => -15,
+
+            // [sunj] 2021-08-10 Implementing Server Push
+            Error::StreamScheduling => -16,
         }
     }
 }
@@ -548,6 +555,9 @@ pub struct Config {
     dgram_send_max_queue_len: usize,
 
     max_send_udp_payload_size: usize,
+
+    /// [sunj] 2021-06-22 Implmenting Stream Scheduling
+    stream_scheduling: StreamScheduling,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -584,6 +594,7 @@ impl Config {
             dgram_send_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
 
             max_send_udp_payload_size: MAX_SEND_UDP_PAYLOAD_SIZE,
+            stream_scheduling: StreamScheduling::RoundRobin,
         })
     }
 
@@ -921,6 +932,33 @@ impl Config {
         self.dgram_recv_max_queue_len = recv_queue_len;
         self.dgram_send_max_queue_len = send_queue_len;
     }
+
+    /// [sunj] 2021-06-22 Implementing Stream Scheduling
+    /// Sets the stream scheduling policy used by string.
+    ///
+    /// The default value is `roundrobin`. On error `Error::StreamScheduling`
+    /// will be returned.
+    ///
+    /// ## Examples:
+    ///
+    /// ```
+    /// # let mut config = quiche::Config::new(0xbabababa)?;
+    /// config.set_stream_scheduling_policy_name("fcfs");
+    /// # Ok::<(), quiche::Error>(())
+    /// ```
+    pub fn set_stream_scheduling_policy_name(&mut self, name: &str) -> Result<()> {
+        self.stream_scheduling = StreamScheduling::from_str(name)?;
+
+        Ok(())
+    }
+
+    /// [sunj] 2021-06-22 Implementing Stream Scheduling
+    /// Sets the stream scheduling policy used.
+    ///
+    /// The default value is `StreamScheduling::RoundRobin`.
+    pub fn set_stream_scheduling_policy(&mut self, scheduling: StreamScheduling) {
+        self.stream_scheduling = scheduling;
+    }
 }
 
 /// A QUIC connection.
@@ -1100,6 +1138,9 @@ pub struct Connection {
 
     /// Whether to emit DATAGRAM frames in the next packet.
     emit_dgram: bool,
+
+    /// [sunj] 2021-08-26
+    stream_scheduling: StreamScheduling,
 }
 
 /// Creates a new server-side connection.
@@ -1439,6 +1480,9 @@ impl Connection {
             ),
 
             emit_dgram: true,
+
+            // [sunj] 2021-08-26
+            stream_scheduling: config.stream_scheduling.clone(),
         });
 
         if let Some(odcid) = odcid {
@@ -2100,7 +2144,7 @@ impl Connection {
                     // Always conclude frame writing on error.
                     q.finish_frames().ok();
                 });
-
+                
                 return Err(e);
             }
         }
@@ -2681,6 +2725,7 @@ impl Connection {
 
             // Create MAX_STREAM_DATA frames as needed.
             for stream_id in self.streams.almost_full() {
+                info!("in send_single(), almost full. stream_id={}", stream_id);
                 let stream = match self.streams.get_mut(stream_id) {
                     Some(v) => v,
 
@@ -3044,7 +3089,12 @@ impl Connection {
                 if stream.is_flushable() {
                     let urgency = stream.urgency;
                     let incremental = stream.incremental;
-                    self.streams.push_flushable(stream_id, urgency, incremental);
+                    
+                    // [sunj] 2021-08-26
+                    match self.stream_scheduling {
+                        StreamScheduling::RoundRobin => self.streams.push_flushable(stream_id, urgency, incremental),
+                        StreamScheduling::FCFS => self.streams.push_front_flushable(stream_id, urgency, incremental),
+                    };
                 }
 
                 // When fuzzing, try to coalesce multiple STREAM frames in the
@@ -3382,7 +3432,7 @@ impl Connection {
         {
             return Err(Error::InvalidStreamState(stream_id));
         }
-
+        
         // Mark the connection as blocked if the connection-level flow control
         // limit doesn't let us buffer all the data.
         //
@@ -3404,7 +3454,7 @@ impl Connection {
 
         // Get existing stream or create a new one.
         let stream = self.get_or_create_stream(stream_id, true)?;
-
+        
         #[cfg(feature = "qlog")]
         let offset = stream.send.off_back();
 
@@ -3427,7 +3477,7 @@ impl Connection {
         let writable = stream.is_writable();
 
         let empty_fin = buf.is_empty() && fin;
-
+        
         if sent < buf.len() {
             let max_off = stream.send.max_off();
 
@@ -3435,7 +3485,7 @@ impl Connection {
         } else {
             self.streams.mark_blocked(stream_id, false, 0);
         }
-
+        
         // If the stream is now flushable push it to the flushable queue, but
         // only if it wasn't already queued.
         //
@@ -3448,7 +3498,7 @@ impl Connection {
         if !writable {
             self.streams.mark_writable(stream_id, false);
         }
-
+        
         self.tx_cap -= sent;
 
         self.tx_data += sent as u64;
@@ -3466,7 +3516,7 @@ impl Connection {
             );
             q.add_event(ev).ok();
         });
-
+        
         Ok(sent)
     }
 
@@ -3525,6 +3575,10 @@ impl Connection {
         &mut self, stream_id: u64, direction: Shutdown, err: u64,
     ) -> Result<()> {
         // Get existing stream.
+        trace!(
+            "[sunj-stream-shutdown] stream_id={}",
+            stream_id,
+        );
         let stream = self.streams.get_mut(stream_id).ok_or(Error::Done)?;
 
         match direction {
@@ -4781,7 +4835,7 @@ impl Connection {
                 if max > MAX_STREAM_ID {
                     return Err(Error::InvalidFrame);
                 }
-
+                
                 self.streams.update_peer_max_streams_uni(max);
             },
 
@@ -5395,6 +5449,32 @@ impl TransportParams {
             Some(self.initial_max_streams_uni.to_string()),
             None, // preferred address
         )
+    }
+}
+
+/// [sunj] 2021-06-22 Implementing Stream Scheduling
+#[derive(Clone, Copy, PartialEq)]
+pub enum StreamScheduling {
+    /// First Come, First Served
+    FCFS,
+
+    /// Round-Robin
+    RoundRobin,
+}
+
+impl FromStr for StreamScheduling {
+    type Err = crate::Error;
+
+    /// Converts a string to `StreamScheduling`.
+    ///
+    /// If `name` is not valid, `Error::StreamScheduling` is returned.
+    fn from_str(name: &str) -> std::result::Result<Self, Self::Err> {
+        match name {
+            "fcfs" => Ok(StreamScheduling::FCFS),
+            "roundrobin" => Ok(StreamScheduling::RoundRobin),
+
+            _ => Err(crate::Error::StreamScheduling),
+        }
     }
 }
 

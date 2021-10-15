@@ -272,6 +272,12 @@ fn main() {
                         info!("GOAWAY id={}", goaway_id);
                     },
 
+                    // [sunj] 2021-06-21 Implementing Server Push
+                    Ok((_stream_id, quiche::h3::Event::PushPromised { .. })) => (),
+                    
+                    // [sunj] 2021-06-21 Implementing Server Push
+                    Ok((_stream_id, quiche::h3::Event::Push { .. })) => (),
+
                     Err(quiche::h3::Error::Done) => {
                         break;
                     },

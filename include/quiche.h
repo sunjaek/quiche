@@ -183,6 +183,9 @@ void quiche_config_set_max_ack_delay(quiche_config *config, uint64_t v);
 // Sets the `disable_active_migration` transport parameter.
 void quiche_config_set_disable_active_migration(quiche_config *config, bool v);
 
+// [sunj] 2021-10-13 Implementing server push
+void quiche_config_set_stream_scheduling(quiche_config *config, const char *name);
+
 enum quiche_cc_algorithm {
     QUICHE_CC_RENO = 0,
     QUICHE_CC_CUBIC = 1,
@@ -556,6 +559,12 @@ void quiche_h3_config_set_qpack_blocked_streams(quiche_h3_config *config, uint64
 // Frees the HTTP/3 config object.
 void quiche_h3_config_free(quiche_h3_config *config);
 
+// [sunj] 2021-09-07 Implementing server push
+void quiche_h3_config_set_promise_headers_path(quiche_h3_config *config, const char *path);
+
+// [sunj] 2021-10-13 Implementing server push
+void quiche_h3_config_set_push_urgency(quiche_h3_config *config, uint64_t v);
+
 // A QUIC connection.
 typedef struct Http3Connection quiche_h3_conn;
 
@@ -626,10 +635,28 @@ int quiche_h3_send_response_with_priority(quiche_h3_conn *conn,
                             quiche_h3_header *headers, size_t headers_len,
                             const char *priority, bool fin);
 
+// [sunj] 2021-09-08 Implementing server push
+int quiche_h3_send_push_headers(quiche_h3_conn *conn, quiche_conn *quic_conn,
+                            uint64_t stream_id, quiche_h3_header *headers,
+                            size_t headers_len, bool fin, uint64_t push_i);
+
+// [sunj] 2021-09-06 Implementing server push
+// Finds the Push stream by its push_id
+int quiche_h3_push_stream_lookup(quiche_h3_conn *conn, uint64_t push_id);
+
+// [sunj] 2021-09-06 Implementing server push
+// Push promise
+ssize_t quiche_h3_push_promise(quiche_h3_conn *conn, quiche_conn *quic_conn, uint64_t stream_id, uint64_t pos, bool fin, quiche_h3_event **ev);
+
 // Sends an HTTP/3 body chunk on the given stream.
 ssize_t quiche_h3_send_body(quiche_h3_conn *conn, quiche_conn *quic_conn,
                             uint64_t stream_id, uint8_t *body, size_t body_len,
                             bool fin);
+
+// Sends an HTTP/3 push body chunk on the given stream.
+ssize_t quiche_h3_send_push_body(quiche_h3_conn *conn, quiche_conn *quic_conn,
+                                 uint64_t stream_id, uint8_t *body, size_t body_len,
+                                 bool fin);
 
 // Reads request or response body data into the provided buffer.
 ssize_t quiche_h3_recv_body(quiche_h3_conn *conn, quiche_conn *quic_conn,

@@ -173,8 +173,10 @@ impl StreamMap {
         &mut self, id: u64, local_params: &crate::TransportParams,
         peer_params: &crate::TransportParams, local: bool, is_server: bool,
     ) -> Result<&mut Stream> {
+        trace!("[sunj-push] get_or_create() 0");
         let stream = match self.streams.entry(id) {
             hash_map::Entry::Vacant(v) => {
+                trace!("[sunj-push] get_or_create() 1");
                 // Stream has already been closed and garbage collected.
                 if self.collected.contains(&id) {
                     return Err(Error::Done);
@@ -201,56 +203,66 @@ impl StreamMap {
                     ),
 
                     // Remotely-initiated unidirectional stream.
-                    (false, false) =>
-                        (local_params.initial_max_stream_data_uni, 0),
+                    (false, false) => {
+                        (local_params.initial_max_stream_data_uni, 0)
+                    }
                 };
-
+                trace!("[sunj-push] get_or_create() 2");
                 // Enforce stream count limits.
                 match (is_local(id, is_server), is_bidi(id)) {
                     (true, true) => {
-                        if self.local_opened_streams_bidi >=
-                            self.peer_max_streams_bidi
+                        trace!("[sunj-push] get_or_create() 2-1 self.local_opened_streams_bidi={}, self.peer_max_streams_bidi={}",
+                            self.local_opened_streams_bidi, self.peer_max_streams_bidi);
+                        if self.local_opened_streams_bidi
+                            >= self.peer_max_streams_bidi
                         {
                             return Err(Error::StreamLimit);
                         }
 
                         self.local_opened_streams_bidi += 1;
-                    },
+                    }
 
                     (true, false) => {
-                        if self.local_opened_streams_uni >=
-                            self.peer_max_streams_uni
+                        trace!("[sunj-push] get_or_create() 2-2 self.local_opened_streams_uni={}, self.peer_max_streams_uni={}",
+                            self.local_opened_streams_uni, self.peer_max_streams_uni);
+                        if self.local_opened_streams_uni
+                            >= self.peer_max_streams_uni
                         {
                             return Err(Error::StreamLimit);
                         }
 
                         self.local_opened_streams_uni += 1;
-                    },
+                    }
 
                     (false, true) => {
-                        if self.peer_opened_streams_bidi >=
-                            self.local_max_streams_bidi
+                        trace!("[sunj-push] get_or_create() 2-3 self.peer_opened_streams_bidi={}, self.local_max_streams_bidi={}",
+                            self.peer_opened_streams_bidi, self.local_max_streams_bidi);
+                        if self.peer_opened_streams_bidi
+                            >= self.local_max_streams_bidi
                         {
                             return Err(Error::StreamLimit);
                         }
 
                         self.peer_opened_streams_bidi += 1;
-                    },
+                    }
 
                     (false, false) => {
-                        if self.peer_opened_streams_uni >=
-                            self.local_max_streams_uni
+                        trace!("[sunj-push] get_or_create() 2-4 self.peer_opened_streams_uni={}, self.local_max_streams_uni={}",
+                            self.peer_opened_streams_uni, self.local_max_streams_uni);
+                        if self.peer_opened_streams_uni
+                            >= self.local_max_streams_uni
                         {
                             return Err(Error::StreamLimit);
                         }
 
                         self.peer_opened_streams_uni += 1;
-                    },
+                    }
                 };
+                trace!("[sunj-push] get_or_create() 3");
 
                 let s = Stream::new(max_rx_data, max_tx_data, is_bidi(id), local);
                 v.insert(s)
-            },
+            }
 
             hash_map::Entry::Occupied(v) => v.into_mut(),
         };
@@ -286,6 +298,33 @@ impl StreamMap {
         } else {
             // Incremental streams are scheduled in a round-robin fashion.
             queues.1.push_back(stream_id)
+        };
+    }
+
+    /// [sunj] 2021-08-26
+    /// Pushes the stream ID to the front of the flushable streams queue with
+    /// the specified urgency.
+    ///
+    /// Note that the caller is responsible for checking that the specified
+    /// stream ID was not in the queue already before calling this.
+    ///
+    /// Queueing a stream multiple times simultaneously means that it might be
+    /// unfairly scheduled more often than other streams, and might also cause
+    /// spurious cycles through the queue, so it should be avoided.
+    pub fn push_front_flushable(&mut self, stream_id: u64, urgency: u8, incr: bool) {
+        // Push the element to the back of the queue corresponding to the given
+        // urgency. If the queue doesn't exist yet, create it first.
+        let queues = self
+            .flushable
+            .entry(urgency)
+            .or_insert_with(|| (BinaryHeap::new(), VecDeque::new()));
+
+        if !incr {
+            // Non-incremental streams are scheduled in order of their stream ID.
+            queues.0.push(std::cmp::Reverse(stream_id))
+        } else {
+            // Incremental streams are scheduled in a first-come-first-served fashion.
+            queues.1.push_front(stream_id)
         };
     }
 
@@ -339,7 +378,7 @@ impl StreamMap {
 
     /// Adds or removes the stream ID to/from the writable streams set.
     ///
-    /// This should also be called anytime a new stream is created, in addition
+    /// This should also be called anytime a new stream is created, in addition`
     /// to when an existing stream becomes writable (or stops being writable).
     ///
     /// If the stream was already in the list, this does nothing.
@@ -529,17 +568,17 @@ impl StreamMap {
     /// Returns true if the max bidirectional streams count needs to be updated
     /// by sending a MAX_STREAMS frame to the peer.
     pub fn should_update_max_streams_bidi(&self) -> bool {
-        self.local_max_streams_bidi_next != self.local_max_streams_bidi &&
-            self.local_max_streams_bidi_next / 2 >
-                self.local_max_streams_bidi - self.peer_opened_streams_bidi
+        self.local_max_streams_bidi_next != self.local_max_streams_bidi
+            && self.local_max_streams_bidi_next / 2
+                > self.local_max_streams_bidi - self.peer_opened_streams_bidi
     }
 
     /// Returns true if the max unidirectional streams count needs to be updated
     /// by sending a MAX_STREAMS frame to the peer.
     pub fn should_update_max_streams_uni(&self) -> bool {
-        self.local_max_streams_uni_next != self.local_max_streams_uni &&
-            self.local_max_streams_uni_next / 2 >
-                self.local_max_streams_uni - self.peer_opened_streams_uni
+        self.local_max_streams_uni_next != self.local_max_streams_uni
+            && self.local_max_streams_uni_next / 2
+                > self.local_max_streams_uni - self.peer_opened_streams_uni
     }
 
     /// Returns the number of active streams in the map.
@@ -598,9 +637,9 @@ impl Stream {
     /// Returns true if the stream has enough flow control capacity to be
     /// written to, and is not finished.
     pub fn is_writable(&self) -> bool {
-        !self.send.shutdown &&
-            !self.send.is_fin() &&
-            self.send.off < self.send.max_data
+        !self.send.shutdown
+            && !self.send.is_fin()
+            && self.send.off < self.send.max_data
     }
 
     /// Returns true if the stream has data to send and is allowed to send at
@@ -922,9 +961,9 @@ impl RecvBuf {
     pub fn almost_full(&self) -> bool {
         // Send MAX_STREAM_DATA when the new limit is at least double the
         // amount of data that can be received before blocking.
-        self.fin_off.is_none() &&
-            self.max_data_next != self.max_data &&
-            self.max_data_next / 2 > self.max_data - self.len
+        self.fin_off.is_none()
+            && self.max_data_next != self.max_data
+            && self.max_data_next / 2 > self.max_data - self.len
     }
 
     /// Returns the largest offset ever received.
@@ -1024,7 +1063,7 @@ impl SendBuf {
             // We are not buffering the full input, so clear the fin flag.
             fin = false;
         }
-
+        
         if let Some(fin_off) = self.fin_off {
             // Can't write past final offset.
             if max_off > fin_off {
@@ -1080,10 +1119,10 @@ impl SendBuf {
 
         let mut next_off = out_off;
 
-        while out_len > 0 &&
-            self.ready() &&
-            self.off_front() == next_off &&
-            self.off_front() < self.max_data
+        while out_len > 0
+            && self.ready()
+            && self.off_front() == next_off
+            && self.off_front() < self.max_data
         {
             let buf = match self.data.get_mut(self.pos) {
                 Some(v) => v,

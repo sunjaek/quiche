@@ -364,6 +364,12 @@ fn main() {
 
                         Ok((_goaway_id, quiche::h3::Event::GoAway)) => (),
 
+                        // [sunj] 2020-09-09 Implementing Server Push
+                        Ok((_stream_id, quiche::h3::Event::PushPromised { .. })) => (),
+                        
+                        // [sunj] 2020-09-11 Implementing Server Push
+                        Ok((_stream_id, quiche::h3::Event::Push { .. })) => (),
+
                         Err(quiche::h3::Error::Done) => {
                             break;
                         },

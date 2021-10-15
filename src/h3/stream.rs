@@ -141,6 +141,9 @@ pub struct Stream {
 
     /// Whether a `Data` event has been triggered for this stream.
     data_event_triggered: bool,
+
+    /// [sunj] 2021-07-08 Implementing Server Push
+    push_id: Option<u64>,
 }
 
 impl Stream {
@@ -179,6 +182,9 @@ impl Stream {
             local_initialized: false,
 
             data_event_triggered: false,
+
+            // [sunj] 2021-07-08 Implementing Server Push
+            push_id: None,
         }
     }
 
@@ -216,10 +222,11 @@ impl Stream {
     }
 
     /// Sets the push ID and transitions to the next state.
-    pub fn set_push_id(&mut self, _id: u64) -> Result<()> {
+    pub fn set_push_id(&mut self, id: u64) -> Result<()> {
         assert_eq!(self.state, State::PushId);
 
-        // TODO: implement push ID.
+        // [sunj] 2021-07-08 Implementing Server Push
+        self.push_id = Some(id);
 
         self.state_transition(State::FrameType, 1, true)?;
 
@@ -528,6 +535,13 @@ impl Stream {
         self.data_event_triggered = true;
 
         true
+    }
+
+    /// [sunj] 2021-07-08 Implementing Server Push
+    ///
+    /// This returns its push_id.
+    pub fn push_id(&self) -> Option<u64> {
+        self.push_id
     }
 
     /// Resets the data triggered state.

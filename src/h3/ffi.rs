@@ -73,6 +73,24 @@ pub extern fn quiche_h3_config_free(config: *mut h3::Config) {
     unsafe { Box::from_raw(config) };
 }
 
+// [sunj] 2021-09-07 Implementing server push
+#[no_mangle]
+pub extern fn quiche_h3_config_set_promise_headers_path(
+    config: &mut h3::Config, path: *const c_char
+) {
+    let path = unsafe { ffi::CStr::from_ptr(path).to_str().unwrap() };
+
+    config.set_promise_headers_path(&path);
+}
+
+// [sunj] 2021-10-13 Implementing server push
+#[no_mangle]
+pub extern fn quiche_h3_config_set_push_urgency(
+    config: &mut h3::Config, v: u64,
+) {
+    config.set_push_urgency(v);
+}
+
 #[no_mangle]
 pub extern fn quiche_h3_conn_new_with_transport(
     quic_conn: &mut Connection, config: &mut h3::Config,
@@ -114,6 +132,11 @@ pub extern fn quiche_h3_event_type(ev: &h3::Event) -> u32 {
         h3::Event::Datagram { .. } => 3,
 
         h3::Event::GoAway { .. } => 4,
+
+        // [sunj] 2021-08-10 Implementing Server Push
+        h3::Event::PushPromised { .. } => 5,
+
+        h3::Event::Push { .. } => 6,
     }
 }
 
@@ -226,6 +249,52 @@ pub extern fn quiche_h3_send_response_with_priority(
     }
 }
 
+// [sunj] 2021-09-08 Implementing server push
+#[no_mangle]
+pub extern fn quiche_h3_send_push_headers(
+    conn: &mut h3::Connection, quic_conn: &mut Connection, stream_id: u64,
+    headers: *const Header, headers_len: size_t, fin: bool, push_id: u64
+) -> c_int {
+    let resp_headers = headers_from_ptr(headers, headers_len);
+
+    match conn.send_push_headers(quic_conn, stream_id, &resp_headers, fin, push_id) {
+        Ok(_) => 0,
+
+        Err(e) => e.to_c() as c_int,
+    }
+}
+
+// [sunj] 2021-09-06 Implementing server push
+#[no_mangle]
+pub extern fn quiche_h3_push_stream_lookup(
+    conn: &mut h3::Connection, push_id: u64
+) -> c_int {
+    match conn.push_map.get(&push_id) {
+        Some(push_stream) => *push_stream as c_int,
+
+        None => -1
+    }
+}
+
+// [sunj] 2021-09-06 Implementing server push
+#[no_mangle]
+pub extern fn quiche_h3_push_promise(
+    conn: &mut h3::Connection, quic_conn: &mut Connection, stream_id: u64,
+    pos: u64, fin: bool, ev: *mut *const h3::Event,
+) -> ssize_t {
+    match conn.push_promise_with_position(quic_conn, stream_id, pos, fin) {
+        Ok((v, event)) => {
+            unsafe {
+                *ev = Box::into_raw(Box::new(event));
+            }
+
+            v as ssize_t
+        },
+
+        Err(e) => e.to_c(),
+    }
+}
+
 #[no_mangle]
 pub extern fn quiche_h3_send_body(
     conn: &mut h3::Connection, quic_conn: &mut Connection, stream_id: u64,
@@ -238,6 +307,24 @@ pub extern fn quiche_h3_send_body(
     let body = unsafe { slice::from_raw_parts(body, body_len) };
 
     match conn.send_body(quic_conn, stream_id, body, fin) {
+        Ok(v) => v as ssize_t,
+
+        Err(e) => e.to_c(),
+    }
+}
+
+#[no_mangle]
+pub extern fn quiche_h3_send_push_body(
+    conn: &mut h3::Connection, quic_conn: &mut Connection, stream_id: u64,
+    body: *const u8, body_len: size_t, fin: bool,
+) -> ssize_t {
+    if body_len > <ssize_t>::max_value() as usize {
+        panic!("The provided buffer is too large");
+    }
+
+    let body = unsafe { slice::from_raw_parts(body, body_len) };
+
+    match conn.send_push_body(quic_conn, stream_id, body, fin) {
         Ok(v) => v as ssize_t,
 
         Err(e) => e.to_c(),
